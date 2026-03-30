@@ -27,7 +27,7 @@ REQUEST_HEADERS = {
 }
 
 st.set_page_config(
-    page_title="Daily News Brief",
+    page_title="Bipzilla News",
     page_icon="🗞️",
     layout="wide",
     initial_sidebar_state="collapsed",
