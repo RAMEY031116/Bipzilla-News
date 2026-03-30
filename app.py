@@ -470,7 +470,11 @@ def filter_by_day(items: List[dict], mode: str) -> List[dict]:
             if published and published.date() == yesterday:
                 filtered.append(item)
 
-    return filtered
+    if filtered:
+        return filtered
+
+    # Fallback so the app never feels broken when feeds have older or missing timestamps.
+    return items
 
 
 def filter_by_query(items: List[dict], query: str) -> List[dict]:
@@ -769,7 +773,7 @@ def main() -> None:
     with controls_col1:
         search_query = st.text_input("Search headlines", placeholder="Try: Microsoft, data breach, Trump, AI, markets...")
     with controls_col2:
-        day_mode = st.selectbox("Show", ["Today", "Yesterday", "All recent"], index=0)
+        day_mode = st.selectbox("Show", ["Today", "Yesterday", "All recent"], index=2)
     with controls_col3:
         show_images = st.toggle("Show images", value=True)
     with controls_col4:
@@ -804,14 +808,23 @@ def main() -> None:
 
     for section in sections_to_show:
         st.markdown(f"## {section}")
-        items = all_news.get(section, [])
-        items = filter_by_day(items, day_mode)
-        items = filter_by_query(items, search_query)
+        original_items = all_news.get(section, [])
+        day_filtered_items = filter_by_day(original_items, day_mode)
+        items = filter_by_query(day_filtered_items, search_query)
+        fallback_used = False
+
+        if not items and day_mode != "All recent":
+            items = filter_by_query(original_items, search_query)
+            fallback_used = bool(items)
+
         items = items[:MAX_ITEMS_PER_SECTION]
 
         if not items:
-            st.info(f"No {section.lower()} items matched this view.")
+            st.info(f"No {section.lower()} items matched your search right now.")
             continue
+
+        if fallback_used:
+            st.caption(f"Showing latest available {section.lower()} stories because no items were found for {day_mode.lower()}.")
 
         for item in items:
             render_article_card(item, show_images=show_images)
