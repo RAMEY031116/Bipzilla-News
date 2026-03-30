@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import html
-import random
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 import feedparser
 import requests
@@ -17,6 +17,14 @@ from zoneinfo import ZoneInfo
 
 LOCAL_TZ = ZoneInfo("Europe/London")
 MAX_ITEMS_PER_SECTION = 8
+DEFAULT_SUMMARY_LIMIT = 720
+FITNESS_SUMMARY_LIMIT = 150
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
 
 st.set_page_config(
     page_title="Daily News Brief",
@@ -42,7 +50,7 @@ FEEDS: Dict[str, List[Dict[str, str]]] = {
             "label": "Google News · Microsoft / Azure / Entra",
             "url": (
                 "https://news.google.com/rss/search?q="
-                + quote_plus("Microsoft Entra OR Azure OR Microsoft security")
+                + quote_plus("Microsoft Entra OR Azure OR Microsoft security OR Copilot")
                 + "&hl=en-GB&gl=GB&ceid=GB:en"
             ),
         },
@@ -58,6 +66,17 @@ FEEDS: Dict[str, List[Dict[str, str]]] = {
             ),
         },
     ],
+    "Health & Fitness": [
+        {"label": "BBC Health", "url": "https://feeds.bbci.co.uk/news/health/rss.xml"},
+        {
+            "label": "Google News · fitness",
+            "url": (
+                "https://news.google.com/rss/search?q="
+                + quote_plus("fitness OR workout OR muscle gain OR weight loss")
+                + "&hl=en-GB&gl=GB&ceid=GB:en"
+            ),
+        },
+    ],
     "Science": [
         {
             "label": "BBC Science & Environment",
@@ -68,6 +87,26 @@ FEEDS: Dict[str, List[Dict[str, str]]] = {
         {
             "label": "BBC Entertainment & Arts",
             "url": "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
+        },
+    ],
+    "Movies & TV": [
+        {
+            "label": "Google News · movies and TV",
+            "url": (
+                "https://news.google.com/rss/search?q="
+                + quote_plus("upcoming movie OR box office OR TV series release")
+                + "&hl=en-GB&gl=GB&ceid=GB:en"
+            ),
+        },
+    ],
+    "Anime & Manga": [
+        {
+            "label": "Google News · anime",
+            "url": (
+                "https://news.google.com/rss/search?q="
+                + quote_plus("anime OR manga release OR anime season")
+                + "&hl=en-GB&gl=GB&ceid=GB:en"
+            ),
         },
     ],
 }
@@ -119,7 +158,12 @@ def fetch_feed(url: str, section: str, source_label: str) -> List[dict]:
 @st.cache_data(ttl=1800)
 def geocode_place(place_name: str) -> Optional[dict]:
     url = "https://geocoding-api.open-meteo.com/v1/search"
-    response = requests.get(url, params={"name": place_name, "count": 1, "language": "en", "format": "json"}, timeout=20)
+    response = requests.get(
+        url,
+        params={"name": place_name, "count": 1, "language": "en", "format": "json"},
+        timeout=20,
+        headers=REQUEST_HEADERS,
+    )
     response.raise_for_status()
     data = response.json()
     results = data.get("results") or []
@@ -141,7 +185,7 @@ def fetch_weather(place_name: str) -> Optional[dict]:
         "forecast_days": 1,
         "timezone": "Europe/London",
     }
-    response = requests.get(forecast_url, params=params, timeout=20)
+    response = requests.get(forecast_url, params=params, timeout=20, headers=REQUEST_HEADERS)
     response.raise_for_status()
     data = response.json()
 
@@ -200,11 +244,144 @@ def extract_summary(entry) -> str:
         if isinstance(content, dict) and content.get("value"):
             candidates.append(content["value"])
 
+    cleaned_candidates = []
     for raw in candidates:
         cleaned = clean_text(raw)
         if cleaned:
-            return shorten(cleaned, 160)
-    return "No short summary provided."
+            cleaned_candidates.append(cleaned)
+
+    if not cleaned_candidates:
+        return "No short summary provided."
+
+    best = max(cleaned_candidates, key=len)
+    best = strip_source_suffix(best)
+    return shorten(best, DEFAULT_SUMMARY_LIMIT)
+
+
+@st.cache_data(ttl=3600)
+def fetch_article_preview(url: str) -> Optional[str]:
+    try:
+        response = requests.get(url, timeout=15, headers=REQUEST_HEADERS)
+        response.raise_for_status()
+    except Exception:
+        return None
+
+    content_type = (response.headers.get("content-type") or "").lower()
+    text = response.text
+
+    if "xml" in content_type or text.lstrip().startswith("<?xml"):
+        preview = extract_preview_from_xml(text)
+        if preview:
+            return shorten(preview, DEFAULT_SUMMARY_LIMIT)
+
+    soup = BeautifulSoup(text, "html.parser")
+
+    meta_candidates = [
+        soup.find("meta", attrs={"property": "og:description"}),
+        soup.find("meta", attrs={"name": "description"}),
+        soup.find("meta", attrs={"name": "twitter:description"}),
+    ]
+    texts: List[str] = []
+
+    for tag in meta_candidates:
+        if tag and tag.get("content"):
+            cleaned = strip_source_suffix(clean_text(tag.get("content")))
+            if len(cleaned) >= 80:
+                texts.append(cleaned)
+
+    paragraph_count = 0
+    for node in soup.find_all(["p", "h2"]):
+        text_value = strip_source_suffix(clean_text(node.get_text(" ", strip=True)))
+        if len(text_value) < 60:
+            continue
+        if is_junk_paragraph(text_value):
+            continue
+        texts.append(text_value)
+        paragraph_count += 1
+        if paragraph_count >= 3:
+            break
+
+    if not texts:
+        return None
+
+    combined = " ".join(unique_in_order(texts))
+    combined = re.sub(r"\s+", " ", combined).strip()
+    return shorten(combined, DEFAULT_SUMMARY_LIMIT)
+
+
+@st.cache_data(ttl=900)
+def fetch_anime_schedule() -> List[dict]:
+    url = "https://api.jikan.moe/v4/schedules"
+    response = requests.get(url, params={"filter": "upcoming", "limit": 8}, timeout=20, headers=REQUEST_HEADERS)
+    response.raise_for_status()
+    data = response.json().get("data", [])
+
+    items = []
+    for anime in data[:8]:
+        title = anime.get("title") or "Untitled"
+        image = (((anime.get("images") or {}).get("jpg") or {}).get("image_url"))
+        broadcast = anime.get("broadcast") or {}
+        item = {
+            "title": title,
+            "day": broadcast.get("day") or "TBA",
+            "time": broadcast.get("time") or "TBA",
+            "url": anime.get("url") or "",
+            "image": image,
+        }
+        items.append(item)
+    return items
+
+
+def extract_preview_from_xml(xml_text: str) -> Optional[str]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+
+    ns = {
+        "content": "http://purl.org/rss/1.0/modules/content/",
+        "media": "http://search.yahoo.com/mrss/",
+    }
+    for tag_name in ["description", "content:encoded"]:
+        elements = root.findall(f".//{tag_name}", ns) if ":" in tag_name else root.findall(f".//{tag_name}")
+        for element in elements:
+            if element is not None and element.text:
+                cleaned = strip_source_suffix(clean_text(element.text))
+                if len(cleaned) >= 80:
+                    return cleaned
+    return None
+
+
+def strip_source_suffix(text: str) -> str:
+    text = re.sub(r"\s*[\-|–|—]\s*(BBC News|BBC|Reuters|Associated Press|AP News).*$", "", text, flags=re.I)
+    return text.strip()
+
+
+def is_junk_paragraph(text: str) -> bool:
+    junk_fragments = [
+        "cookie",
+        "subscribe",
+        "newsletter",
+        "all rights reserved",
+        "advertisement",
+        "sign up",
+        "privacy policy",
+        "terms of use",
+    ]
+    lowered = text.lower()
+    return any(fragment in lowered for fragment in junk_fragments)
+
+
+def unique_in_order(items: List[str]) -> List[str]:
+    seen = set()
+    output = []
+    for item in items:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output
 
 
 def parse_published(entry) -> Optional[datetime]:
@@ -354,26 +531,17 @@ def today_fact() -> str:
     return DAILY_FACTS[index]
 
 
-def build_quiz_candidates(all_sections: Dict[str, List[dict]]) -> List[dict]:
-    candidates: List[dict] = []
-    for section, items in all_sections.items():
-        for item in items[:2]:
-            if item.get("title"):
-                candidates.append(item)
-    return candidates
-
-
 def render_top_bar() -> None:
     logo_col, text_col = st.columns([1, 4])
     logo_path = Path("assets/logo.png")
 
     with logo_col:
         if logo_path.exists():
-            st.image(str(logo_path), use_container_width=True)
+            st.image(str(logo_path), width=140)
         else:
             st.markdown(
                 """
-                <div style="height:96px;border:1px dashed #94a3b8;border-radius:18px;display:flex;align-items:center;justify-content:center;font-weight:700;opacity:.8;">
+                <div style="height:96px;border:1px dashed var(--outline);border-radius:18px;display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--muted);background:var(--surface);">
                     LOGO
                 </div>
                 """,
@@ -381,8 +549,9 @@ def render_top_bar() -> None:
             )
 
     with text_col:
+        st.markdown("<div class='brand-kicker'>Your daily scroll</div>", unsafe_allow_html=True)
         st.title("Daily News Brief")
-        st.caption("Fast, simple headlines for your morning scroll. Built for quick reading, mobile use, and zero paid APIs.")
+        st.caption("Fast, simple headlines with enough detail to understand the story before work, on the train, or during a quick scroll.")
 
 
 def render_summary_cards(weather: Optional[dict], total_articles: int) -> None:
@@ -413,79 +582,176 @@ def render_summary_cards(weather: Optional[dict], total_articles: int) -> None:
         st.write("Aim: **10 to 15 minutes** for a full scroll.")
 
 
+def get_display_summary(item: dict) -> str:
+    summary = item.get("summary") or "No short summary provided."
+    preview = None
+
+    if len(summary) < 420 and item.get("section") != "Health & Fitness":
+        preview = fetch_article_preview(item["link"])
+
+    final_text = preview or summary
+
+    if item.get("section") == "Health & Fitness":
+        return shorten(final_text, FITNESS_SUMMARY_LIMIT)
+
+    return shorten(final_text, DEFAULT_SUMMARY_LIMIT)
+
+
 def render_article_card(item: dict, show_images: bool) -> None:
+    summary_text = get_display_summary(item)
+    domain = urlparse(item["link"]).netloc.replace("www.", "")
+
     with st.container(border=True):
         has_image = show_images and bool(item.get("image"))
 
         if has_image:
-            image_col, content_col = st.columns([1, 4], gap="medium")
+            image_col, content_col = st.columns([1, 5], gap="medium")
             with image_col:
                 try:
-                    st.image(item["image"], width=140)
+                    st.image(item["image"], width=104)
                 except Exception:
                     has_image = False
 
             with content_col:
-                st.markdown(f"#### {item['title']}")
-                st.caption(f"{item['source']} · {relative_time(item['published'])}")
-                st.write(item["summary"])
-                st.link_button("Open story", item["link"], use_container_width=True)
+                st.markdown(f"<div class='story-title'>{item['title']}</div>", unsafe_allow_html=True)
+                st.caption(f"{item['source']} · {relative_time(item['published'])} · {domain}")
+                st.markdown(f"<div class='summary-copy'>{summary_text}</div>", unsafe_allow_html=True)
+                st.link_button("Read full story", item["link"], use_container_width=False)
         else:
-            st.markdown(f"#### {item['title']}")
-            st.caption(f"{item['source']} · {relative_time(item['published'])}")
-            st.write(item["summary"])
-            st.link_button("Open story", item["link"], use_container_width=True)
+            st.markdown(f"<div class='story-title'>{item['title']}</div>", unsafe_allow_html=True)
+            st.caption(f"{item['source']} · {relative_time(item['published'])} · {domain}")
+            st.markdown(f"<div class='summary-copy'>{summary_text}</div>", unsafe_allow_html=True)
+            st.link_button("Read full story", item["link"], use_container_width=False)
 
 
-def render_quiz(all_sections: Dict[str, List[dict]]) -> None:
-    st.markdown("## 🎯 Mini headline quiz")
-    quiz_pool = build_quiz_candidates(all_sections)
-    if len(quiz_pool) < 3:
-        st.info("Not enough headlines yet to build the quiz.")
+def render_anime_schedule() -> None:
+    st.markdown("## Anime calendar")
+    try:
+        schedule = fetch_anime_schedule()
+    except Exception:
+        schedule = []
+
+    if not schedule:
+        st.info("Anime schedule could not be loaded right now.")
         return
 
-    rng = random.Random(datetime.now(LOCAL_TZ).strftime("%Y-%m-%d"))
-    chosen = rng.sample(quiz_pool, k=min(3, len(quiz_pool)))
-    all_sections_list = list(FEEDS.keys())
-
-    for idx, item in enumerate(chosen, start=1):
-        correct = item["section"]
-        wrong_options = [s for s in all_sections_list if s != correct]
-        options = rng.sample(wrong_options, k=min(3, len(wrong_options))) + [correct]
-        rng.shuffle(options)
-
-        st.markdown(f"**Q{idx}. Which section fits this headline best?**")
-        st.write(item["title"])
-        key = f"quiz_{idx}_{datetime.now(LOCAL_TZ).strftime('%Y%m%d')}"
-        answer = st.radio("Choose one", options, key=key, horizontal=True, label_visibility="collapsed")
-        if st.button(f"Check Q{idx}", key=f"btn_{key}"):
-            if answer == correct:
-                st.success("Correct.")
-            else:
-                st.error(f"Not quite. The best match was {correct}.")
+    for item in schedule[:6]:
+        line = f"**{item['title']}** · {item['day']} · {item['time']}"
+        if item.get("url"):
+            st.markdown(f"{line}  \n[Open details]({item['url']})")
+        else:
+            st.markdown(line)
 
 
-def add_styles() -> None:
+def add_styles(theme_mode: str) -> None:
+    is_dark = theme_mode == "Dark"
+
+    if is_dark:
+        palette = {
+            "bg": "#0b1220",
+            "surface": "#111827",
+            "surface_soft": "#0f172a",
+            "text": "#e5eefb",
+            "muted": "#94a3b8",
+            "outline": "rgba(148, 163, 184, 0.18)",
+            "shadow": "rgba(2, 8, 23, 0.38)",
+            "accent": "#60a5fa",
+            "summary": "#d7e3f5",
+        }
+    else:
+        palette = {
+            "bg": "#f5f7fb",
+            "surface": "#ffffff",
+            "surface_soft": "#eef3fb",
+            "text": "#0f172a",
+            "muted": "#64748b",
+            "outline": "rgba(148, 163, 184, 0.18)",
+            "shadow": "rgba(15, 23, 42, 0.08)",
+            "accent": "#2563eb",
+            "summary": "#334155",
+        }
+
     st.markdown(
-        """
+        f"""
         <style>
-            .block-container {
-                max-width: 1100px;
-                padding-top: 1.2rem;
+            :root {{
+                --bg: {palette['bg']};
+                --surface: {palette['surface']};
+                --surface-soft: {palette['surface_soft']};
+                --text: {palette['text']};
+                --muted: {palette['muted']};
+                --outline: {palette['outline']};
+                --shadow: {palette['shadow']};
+                --accent: {palette['accent']};
+                --summary: {palette['summary']};
+            }}
+            .block-container {{
+                max-width: 1120px;
+                padding-top: 1rem;
                 padding-bottom: 3rem;
-            }
-            .stApp {
-                background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
-            }
-            h1, h2, h3, h4, p, div, span, label {
+            }}
+            .stApp {{
+                background: linear-gradient(180deg, var(--bg) 0%, var(--surface-soft) 100%);
+            }}
+            .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {{
+                color: var(--text);
+            }}
+            div[data-testid="stVerticalBlockBorderWrapper"] {{
+                background: var(--surface);
+                border-radius: 20px;
+                box-shadow: 0 10px 30px var(--shadow);
+                border: 1px solid var(--outline);
+            }}
+            h1, h2, h3, h4, p, div, span, label {{
                 word-wrap: break-word;
-            }
-            @media (max-width: 768px) {
-                .block-container {
+                color: var(--text);
+            }}
+            .brand-kicker {{
+                color: var(--accent);
+                font-size: 0.86rem;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                margin-bottom: 0.25rem;
+            }}
+            .story-title {{
+                font-size: 1.22rem;
+                font-weight: 700;
+                line-height: 1.35;
+                margin-bottom: 0.3rem;
+                color: var(--text);
+            }}
+            .summary-copy {{
+                font-size: 1.04rem;
+                line-height: 1.78;
+                color: var(--summary);
+                margin-bottom: 0.9rem;
+            }}
+            .stCaptionContainer, [data-testid="stCaptionContainer"] {{
+                color: var(--muted);
+            }}
+            .stTextInput input, .stSelectbox div[data-baseweb="select"] > div, .stMultiSelect div[data-baseweb="select"] > div {{
+                background: var(--surface) !important;
+                color: var(--text) !important;
+                border: 1px solid var(--outline) !important;
+                border-radius: 14px !important;
+            }}
+            .stButton button, .stLinkButton a {{
+                border-radius: 999px !important;
+            }}
+            @media (max-width: 768px) {{
+                .block-container {{
                     padding-left: 0.9rem;
                     padding-right: 0.9rem;
-                }
-            }
+                }}
+                .story-title {{
+                    font-size: 1.08rem;
+                }}
+                .summary-copy {{
+                    font-size: 1rem;
+                    line-height: 1.7;
+                }}
+            }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -493,18 +759,24 @@ def add_styles() -> None:
 
 
 def main() -> None:
-    add_styles()
+    default_theme = st.session_state.get("theme_mode", "Dark")
+    add_styles(default_theme)
     render_top_bar()
 
     st.markdown("---")
 
-    controls_col1, controls_col2, controls_col3 = st.columns([2.2, 1.2, 1])
+    controls_col1, controls_col2, controls_col3, controls_col4 = st.columns([2.2, 1.2, 1, 1])
     with controls_col1:
         search_query = st.text_input("Search headlines", placeholder="Try: Microsoft, data breach, Trump, AI, markets...")
     with controls_col2:
         day_mode = st.selectbox("Show", ["Today", "Yesterday", "All recent"], index=0)
     with controls_col3:
         show_images = st.toggle("Show images", value=True)
+    with controls_col4:
+        theme_mode = st.selectbox("Theme", ["Dark", "Light"], index=0 if default_theme == "Dark" else 1)
+        st.session_state["theme_mode"] = theme_mode
+
+    add_styles(theme_mode)
 
     sections_to_show = st.multiselect(
         "Sections",
@@ -544,21 +816,10 @@ def main() -> None:
         for item in items:
             render_article_card(item, show_images=show_images)
 
+        if section == "Anime & Manga":
+            render_anime_schedule()
+
         st.markdown("")
-
-    st.markdown("---")
-    render_quiz(all_news)
-
-    with st.expander("How to customise this later"):
-        st.markdown(
-            """
-            - Replace the logo placeholder by dropping your own `logo.png` into `assets/logo.png`.
-            - Add more feeds inside the `FEEDS` dictionary.
-            - Change the weather city from `London` to your town or postcode area.
-            - Switch the default view from `Today` to `All recent` if you want a busier feed.
-            - Deploy free on Streamlit Community Cloud after pushing to GitHub.
-            """
-        )
 
 
 if __name__ == "__main__":
