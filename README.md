@@ -1,28 +1,23 @@
-# Morning Brief (free Streamlit app)
+# Daily News Brief (free Streamlit app)
 
-A one-page Streamlit news app with a cleaner news-style layout and fuller story summaries.
-
-## What it includes
+A one-page Streamlit app that gives you short, readable headlines for:
 - Top stories
 - Politics
 - Finance
 - Tech
 - Cybersecurity / data breaches
-- Health & fitness
 - Science
-- Movies & TV
-- Anime & manga
+- Arts & celebrity
 - Local weather
 - Daily fact
-- Logo placeholder that uses `assets/logo.png`
+- Mini headline quiz
 
-## Why this version is better
+## Why this version is good
 - Free to run
-- No paid API needed for the main news feed
-- Shows more detail than just headlines
-- Keeps a simple one-page scroll layout
-- Works well on mobile
+- No API keys needed for the first version
+- Mobile-friendly one-page layout
 - Easy to deploy on Streamlit Community Cloud
+- Easy to expand later
 
 ## Run locally
 
@@ -32,15 +27,16 @@ streamlit run app.py
 ```
 
 ## Add your logo
-Put your image file here:
+Put your logo file here:
 
 ```text
 assets/logo.png
 ```
 
-Then refresh the app.
-
-## Notes
-- Some stories use the RSS summary only.
-- When the RSS snippet is too short, the app tries to pull a cleaner description from the article page.
-- The anime calendar uses the Jikan API.
+## Nice upgrades for version 2
+- Save favourite articles
+- Email yourself a daily digest
+- Add text-to-speech for a toilet-mode audio summary
+- Add your own custom topic feed
+- Add sentiment tags like calm / urgent / watchlist
+- Add a swipe-card mobile layout later with a custom frontend
