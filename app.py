@@ -19,8 +19,8 @@ from zoneinfo import ZoneInfo
 # BIPZILLA NEWS — CLEAN DAILY BRIEFING VERSION
 # =========================================================
 # What this version improves:
-# - Less repeated news using stronger title similarity checks
-# - Cleaner daily briefing layout
+# - More polished news dashboard layout
+# - Better story organisation
 # - Uses the existing Top Stories section instead of repeating a separate briefing
 # - Shorter summaries so there is less to read
 # - Better looking story cards
@@ -617,10 +617,10 @@ def render_top_bar() -> None:
             st.markdown("<div class='logo-placeholder'>BZ</div>", unsafe_allow_html=True)
 
     with text_col:
-        st.markdown("<div class='brand-kicker'>Your cleaner daily briefing</div>", unsafe_allow_html=True)
+        st.markdown("<div class='brand-kicker'>Daily news dashboard</div>", unsafe_allow_html=True)
         st.markdown("<h1 class='app-title'>Bipzilla News</h1>", unsafe_allow_html=True)
         st.markdown(
-            "<p class='hero-copy'>A faster, cleaner news dashboard with fewer repeated stories, short explanations, weather, anime releases and quick filters.</p>",
+            "<p class='hero-copy'>Your personal place for headlines, weather, tech, cyber, entertainment, anime and quick daily updates.</p>",
             unsafe_allow_html=True,
         )
 
@@ -652,10 +652,10 @@ def render_dashboard_cards(weather: Optional[dict], total_articles: int, unique_
 
     with col2:
         st.markdown("<div class='mini-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='mini-label'>Stories after clean-up</div>", unsafe_allow_html=True)
+        st.markdown("<div class='mini-label'>Today’s headlines</div>", unsafe_allow_html=True)
         st.markdown(f"<div class='mini-number'>{total_articles}</div>", unsafe_allow_html=True)
         st.markdown(
-            f"<div class='mini-copy'>{unique_today} available today. Repeated headlines are removed automatically.</div>",
+            f"<div class='mini-copy'>{unique_today} stories available today across your selected sections.</div>",
             unsafe_allow_html=True,
         )
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1026,7 +1026,7 @@ def main() -> None:
 
     st.markdown("---")
     st.markdown("## News sections")
-    st.caption("Use the Top Stories tab first, then browse the other sections only when you want more detail.")
+    st.caption("Start with Top Stories, or choose a section to browse by topic.")
 
     if not selected_sections:
         st.info("Choose at least one section to show news.")
