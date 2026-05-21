@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 import re
 import xml.etree.ElementTree as ET
-from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -22,7 +21,7 @@ from zoneinfo import ZoneInfo
 # What this version improves:
 # - Less repeated news using stronger title similarity checks
 # - Cleaner daily briefing layout
-# - Top stories section before the full feed
+# - Uses the existing Top Stories section instead of repeating a separate briefing
 # - Shorter summaries so there is less to read
 # - Better looking story cards
 # - Category tabs instead of one long repetitive page
@@ -31,7 +30,6 @@ from zoneinfo import ZoneInfo
 
 LOCAL_TZ = ZoneInfo("Europe/London")
 MAX_ITEMS_PER_SECTION = 6
-TOP_BRIEFING_ITEMS = 6
 DEFAULT_SUMMARY_LIMIT = 360
 COMPACT_SUMMARY_LIMIT = 220
 FITNESS_SUMMARY_LIMIT = 150
@@ -551,31 +549,6 @@ def get_all_items(all_news: Dict[str, List[dict]]) -> List[dict]:
     )
 
 
-def build_top_briefing(all_news: Dict[str, List[dict]], day_mode: str, query: str) -> List[dict]:
-    all_items = get_all_items(all_news)
-    all_items = filter_by_day(all_items, day_mode)
-    all_items = filter_by_query(all_items, query)
-
-    # Balance the briefing so one category does not dominate everything.
-    section_counter = Counter()
-    picked = []
-    seen_titles: List[set] = []
-
-    for item in all_items:
-        sig = title_tokens(item["title"])
-        if is_similar_to_existing(sig, seen_titles, threshold=0.55):
-            continue
-        if section_counter[item["section"]] >= 2:
-            continue
-        section_counter[item["section"]] += 1
-        seen_titles.append(sig)
-        picked.append(item)
-        if len(picked) >= TOP_BRIEFING_ITEMS:
-            break
-
-    return picked
-
-
 def get_display_summary(item: dict, compact: bool = False) -> str:
     summary = item.get("summary") or "No short summary provided."
 
@@ -723,20 +696,6 @@ def render_article_content(item: dict, summary_text: str) -> None:
     st.markdown(f"<div class='story-title'>{item['title']}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='summary-copy'>{summary_text}</div>", unsafe_allow_html=True)
     st.link_button("Read full story", item["link"], use_container_width=False)
-
-
-def render_top_briefing(items: List[dict], show_images: bool) -> None:
-    st.markdown("## Today’s clean briefing")
-    st.caption("A short mixed feed from your sections, with repeated versions removed.")
-
-    if not items:
-        st.info("No briefing items matched your filters right now.")
-        return
-
-    left, right = st.columns(2)
-    for index, item in enumerate(items):
-        with left if index % 2 == 0 else right:
-            render_article_card(item, show_images=show_images, compact=True)
 
 
 def render_section(section: str, items: List[dict], show_images: bool) -> None:
@@ -1065,15 +1024,9 @@ def main() -> None:
 
     render_dashboard_cards(weather, total_articles, unique_today)
 
-    top_items = build_top_briefing(
-        {section: all_news.get(section, []) for section in selected_sections},
-        day_mode=day_mode,
-        query=search_query,
-    )
-    render_top_briefing(top_items, show_images=show_images)
-
     st.markdown("---")
-    st.markdown("## Browse by section")
+    st.markdown("## News sections")
+    st.caption("Use the Top Stories tab first, then browse the other sections only when you want more detail.")
 
     if not selected_sections:
         st.info("Choose at least one section to show news.")
