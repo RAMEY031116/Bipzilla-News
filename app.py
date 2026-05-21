@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import re
 import xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -15,10 +16,27 @@ from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
 
 
+# =========================================================
+# BIPZILLA NEWS — CLEAN DAILY BRIEFING VERSION
+# =========================================================
+# What this version improves:
+# - Less repeated news using stronger title similarity checks
+# - Cleaner daily briefing layout
+# - Top stories section before the full feed
+# - Shorter summaries so there is less to read
+# - Better looking story cards
+# - Category tabs instead of one long repetitive page
+# - Keeps your existing features: weather, daily fact, anime, search, filters, theme, images
+# =========================================================
+
 LOCAL_TZ = ZoneInfo("Europe/London")
-MAX_ITEMS_PER_SECTION = 8
-DEFAULT_SUMMARY_LIMIT = 720
+MAX_ITEMS_PER_SECTION = 6
+TOP_BRIEFING_ITEMS = 6
+DEFAULT_SUMMARY_LIMIT = 360
+COMPACT_SUMMARY_LIMIT = 220
 FITNESS_SUMMARY_LIMIT = 150
+REQUEST_TIMEOUT = 20
+
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -58,10 +76,10 @@ FEEDS: Dict[str, List[Dict[str, str]]] = {
     "Cybersecurity": [
         {"label": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/"},
         {
-            "label": "Google News · data breaches",
+            "label": "Google News · cyber security",
             "url": (
                 "https://news.google.com/rss/search?q="
-                + quote_plus("data breach OR ransomware OR cyber attack")
+                + quote_plus("data breach OR ransomware OR cyber attack OR cyber security")
                 + "&hl=en-GB&gl=GB&ceid=GB:en"
             ),
         },
@@ -118,14 +136,24 @@ DAILY_FACTS = [
     "Weather forecasts improve when models from multiple providers are combined, which is why many modern weather apps blend sources.",
     "A strong password helps, but multi-factor authentication reduces risk much more when passwords get leaked in a breach.",
     "The word 'robot' comes from a Czech word meaning forced labour.",
-    "Many major cyber incidents start with phishing, stolen credentials, or an unpatched internet-facing device rather than a dramatic 'movie-style' hack.",
+    "Many major cyber incidents start with phishing, stolen credentials, or an unpatched internet-facing device rather than a dramatic movie-style hack.",
     "RSS is old, but it is still one of the simplest free ways to build your own personal news app.",
     "The London Stock Exchange began in the 18th century in coffee houses before it became a formal exchange.",
     "Small daily news habits work better than weekend catch-up because repetition helps you recognise names, trends, and recurring issues faster.",
 ]
 
+STOP_WORDS = {
+    "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for", "with", "at", "by",
+    "from", "as", "is", "are", "was", "were", "be", "been", "being", "it", "this", "that",
+    "new", "latest", "live", "updates", "update", "news", "bbc", "google", "says", "after",
+}
 
-@st.cache_data(ttl=900)
+
+# =========================================================
+# DATA FETCHING
+# =========================================================
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_feed(url: str, section: str, source_label: str) -> List[dict]:
     parsed = feedparser.parse(url)
     items: List[dict] = []
@@ -149,43 +177,92 @@ def fetch_feed(url: str, section: str, source_label: str) -> List[dict]:
                 "section": section,
                 "source": source_label,
                 "image": image,
+                "domain": urlparse(link).netloc.replace("www.", ""),
             }
         )
 
     return items
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=900, show_spinner=False)
+def load_all_news() -> Dict[str, List[dict]]:
+    all_sections: Dict[str, List[dict]] = {}
+    global_seen_signatures: List[set] = []
+    global_seen_links = set()
+
+    for section, sources in FEEDS.items():
+        section_items: List[dict] = []
+        section_signatures: List[set] = []
+
+        for source in sources:
+            try:
+                entries = fetch_feed(source["url"], section, source["label"])
+            except Exception:
+                entries = []
+
+            for item in entries:
+                link_key = normalise_url(item["link"])
+                title_signature = title_tokens(item["title"])
+
+                if not title_signature:
+                    continue
+
+                if link_key in global_seen_links:
+                    continue
+
+                # Avoid repeated versions of the same story within the section and across the whole app.
+                if is_similar_to_existing(title_signature, section_signatures, threshold=0.58):
+                    continue
+
+                if is_similar_to_existing(title_signature, global_seen_signatures, threshold=0.72):
+                    continue
+
+                global_seen_links.add(link_key)
+                section_signatures.append(title_signature)
+                global_seen_signatures.append(title_signature)
+                section_items.append(item)
+
+        section_items.sort(
+            key=lambda x: x["published"] or datetime(1970, 1, 1, tzinfo=LOCAL_TZ),
+            reverse=True,
+        )
+        all_sections[section] = section_items
+
+    return all_sections
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def geocode_place(place_name: str) -> Optional[dict]:
-    url = "https://geocoding-api.open-meteo.com/v1/search"
     response = requests.get(
-        url,
+        "https://geocoding-api.open-meteo.com/v1/search",
         params={"name": place_name, "count": 1, "language": "en", "format": "json"},
-        timeout=20,
+        timeout=REQUEST_TIMEOUT,
         headers=REQUEST_HEADERS,
     )
     response.raise_for_status()
-    data = response.json()
-    results = data.get("results") or []
+    results = response.json().get("results") or []
     return results[0] if results else None
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_weather(place_name: str) -> Optional[dict]:
     location = geocode_place(place_name)
     if not location:
         return None
 
-    forecast_url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": location["latitude"],
-        "longitude": location["longitude"],
-        "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
-        "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-        "forecast_days": 1,
-        "timezone": "Europe/London",
-    }
-    response = requests.get(forecast_url, params=params, timeout=20, headers=REQUEST_HEADERS)
+    response = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "forecast_days": 1,
+            "timezone": "Europe/London",
+        },
+        timeout=REQUEST_TIMEOUT,
+        headers=REQUEST_HEADERS,
+    )
     response.raise_for_status()
     data = response.json()
 
@@ -196,42 +273,123 @@ def fetch_weather(place_name: str) -> Optional[dict]:
     }
 
 
-@st.cache_data(ttl=900)
-def load_all_news() -> Dict[str, List[dict]]:
-    all_sections: Dict[str, List[dict]] = {}
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_anime_schedule() -> List[dict]:
+    response = requests.get(
+        "https://api.jikan.moe/v4/schedules",
+        params={"filter": "upcoming", "limit": 8},
+        timeout=REQUEST_TIMEOUT,
+        headers=REQUEST_HEADERS,
+    )
+    response.raise_for_status()
+    data = response.json().get("data", [])
 
-    for section, sources in FEEDS.items():
-        section_items: List[dict] = []
-        seen = set()
-
-        for source in sources:
-            try:
-                entries = fetch_feed(source["url"], section, source["label"])
-            except Exception:
-                entries = []
-
-            for item in entries:
-                key = normalise_key(item["title"], item["link"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                section_items.append(item)
-
-        section_items.sort(key=lambda x: x["published"] or datetime(1970, 1, 1, tzinfo=LOCAL_TZ), reverse=True)
-        all_sections[section] = section_items
-
-    return all_sections
+    items = []
+    for anime in data[:8]:
+        broadcast = anime.get("broadcast") or {}
+        items.append(
+            {
+                "title": anime.get("title") or "Untitled",
+                "day": broadcast.get("day") or "TBA",
+                "time": broadcast.get("time") or "TBA",
+                "url": anime.get("url") or "",
+                "image": (((anime.get("images") or {}).get("jpg") or {}).get("image_url")),
+            }
+        )
+    return items
 
 
-def normalise_key(title: str, link: str) -> str:
-    return re.sub(r"\W+", "", f"{title.lower()}::{link.lower()}")
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_article_preview(url: str) -> Optional[str]:
+    try:
+        response = requests.get(url, timeout=15, headers=REQUEST_HEADERS)
+        response.raise_for_status()
+    except Exception:
+        return None
 
+    content_type = (response.headers.get("content-type") or "").lower()
+    text = response.text
+
+    if "xml" in content_type or text.lstrip().startswith("<?xml"):
+        preview = extract_preview_from_xml(text)
+        return shorten(preview, DEFAULT_SUMMARY_LIMIT) if preview else None
+
+    soup = BeautifulSoup(text, "html.parser")
+    texts: List[str] = []
+
+    for selector in [
+        {"property": "og:description"},
+        {"name": "description"},
+        {"name": "twitter:description"},
+    ]:
+        tag = soup.find("meta", attrs=selector)
+        if tag and tag.get("content"):
+            cleaned = strip_source_suffix(clean_text(tag.get("content")))
+            if len(cleaned) >= 80:
+                texts.append(cleaned)
+
+    paragraph_count = 0
+    for node in soup.find_all(["p", "h2"]):
+        text_value = strip_source_suffix(clean_text(node.get_text(" ", strip=True)))
+        if len(text_value) < 60 or is_junk_paragraph(text_value):
+            continue
+        texts.append(text_value)
+        paragraph_count += 1
+        if paragraph_count >= 2:
+            break
+
+    if not texts:
+        return None
+
+    combined = " ".join(unique_in_order(texts))
+    return shorten(combined, DEFAULT_SUMMARY_LIMIT)
+
+
+# =========================================================
+# CLEANING, FILTERING AND DEDUPING
+# =========================================================
 
 def clean_text(value: str) -> str:
     text = html.unescape(value or "")
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def strip_source_suffix(text: str) -> str:
+    text = re.sub(r"\s*[\-|–|—]\s*(BBC News|BBC|Reuters|Associated Press|AP News|The Guardian|Sky News).*$", "", text, flags=re.I)
+    return text.strip()
+
+
+def shorten(text: Optional[str], limit: int) -> str:
+    if not text:
+        return "No short summary provided."
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    trimmed = text[:limit].rsplit(" ", 1)[0].strip()
+    return f"{trimmed}…"
+
+
+def normalise_url(link: str) -> str:
+    parsed = urlparse(link)
+    return f"{parsed.netloc}{parsed.path}".lower().strip("/")
+
+
+def title_tokens(title: str) -> set:
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", title.lower())
+    words = [word for word in cleaned.split() if len(word) > 2 and word not in STOP_WORDS]
+    return set(words)
+
+
+def jaccard_similarity(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def is_similar_to_existing(signature: set, existing_signatures: List[set], threshold: float) -> bool:
+    return any(jaccard_similarity(signature, existing) >= threshold for existing in existing_signatures)
 
 
 def extract_summary(entry) -> str:
@@ -246,7 +404,7 @@ def extract_summary(entry) -> str:
 
     cleaned_candidates = []
     for raw in candidates:
-        cleaned = clean_text(raw)
+        cleaned = strip_source_suffix(clean_text(raw))
         if cleaned:
             cleaned_candidates.append(cleaned)
 
@@ -254,82 +412,7 @@ def extract_summary(entry) -> str:
         return "No short summary provided."
 
     best = max(cleaned_candidates, key=len)
-    best = strip_source_suffix(best)
     return shorten(best, DEFAULT_SUMMARY_LIMIT)
-
-
-@st.cache_data(ttl=3600)
-def fetch_article_preview(url: str) -> Optional[str]:
-    try:
-        response = requests.get(url, timeout=15, headers=REQUEST_HEADERS)
-        response.raise_for_status()
-    except Exception:
-        return None
-
-    content_type = (response.headers.get("content-type") or "").lower()
-    text = response.text
-
-    if "xml" in content_type or text.lstrip().startswith("<?xml"):
-        preview = extract_preview_from_xml(text)
-        if preview:
-            return shorten(preview, DEFAULT_SUMMARY_LIMIT)
-
-    soup = BeautifulSoup(text, "html.parser")
-
-    meta_candidates = [
-        soup.find("meta", attrs={"property": "og:description"}),
-        soup.find("meta", attrs={"name": "description"}),
-        soup.find("meta", attrs={"name": "twitter:description"}),
-    ]
-    texts: List[str] = []
-
-    for tag in meta_candidates:
-        if tag and tag.get("content"):
-            cleaned = strip_source_suffix(clean_text(tag.get("content")))
-            if len(cleaned) >= 80:
-                texts.append(cleaned)
-
-    paragraph_count = 0
-    for node in soup.find_all(["p", "h2"]):
-        text_value = strip_source_suffix(clean_text(node.get_text(" ", strip=True)))
-        if len(text_value) < 60:
-            continue
-        if is_junk_paragraph(text_value):
-            continue
-        texts.append(text_value)
-        paragraph_count += 1
-        if paragraph_count >= 3:
-            break
-
-    if not texts:
-        return None
-
-    combined = " ".join(unique_in_order(texts))
-    combined = re.sub(r"\s+", " ", combined).strip()
-    return shorten(combined, DEFAULT_SUMMARY_LIMIT)
-
-
-@st.cache_data(ttl=900)
-def fetch_anime_schedule() -> List[dict]:
-    url = "https://api.jikan.moe/v4/schedules"
-    response = requests.get(url, params={"filter": "upcoming", "limit": 8}, timeout=20, headers=REQUEST_HEADERS)
-    response.raise_for_status()
-    data = response.json().get("data", [])
-
-    items = []
-    for anime in data[:8]:
-        title = anime.get("title") or "Untitled"
-        image = (((anime.get("images") or {}).get("jpg") or {}).get("image_url"))
-        broadcast = anime.get("broadcast") or {}
-        item = {
-            "title": title,
-            "day": broadcast.get("day") or "TBA",
-            "time": broadcast.get("time") or "TBA",
-            "url": anime.get("url") or "",
-            "image": image,
-        }
-        items.append(item)
-    return items
 
 
 def extract_preview_from_xml(xml_text: str) -> Optional[str]:
@@ -338,10 +421,7 @@ def extract_preview_from_xml(xml_text: str) -> Optional[str]:
     except ET.ParseError:
         return None
 
-    ns = {
-        "content": "http://purl.org/rss/1.0/modules/content/",
-        "media": "http://search.yahoo.com/mrss/",
-    }
+    ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
     for tag_name in ["description", "content:encoded"]:
         elements = root.findall(f".//{tag_name}", ns) if ":" in tag_name else root.findall(f".//{tag_name}")
         for element in elements:
@@ -352,21 +432,10 @@ def extract_preview_from_xml(xml_text: str) -> Optional[str]:
     return None
 
 
-def strip_source_suffix(text: str) -> str:
-    text = re.sub(r"\s*[\-|–|—]\s*(BBC News|BBC|Reuters|Associated Press|AP News).*$", "", text, flags=re.I)
-    return text.strip()
-
-
 def is_junk_paragraph(text: str) -> bool:
     junk_fragments = [
-        "cookie",
-        "subscribe",
-        "newsletter",
-        "all rights reserved",
-        "advertisement",
-        "sign up",
-        "privacy policy",
-        "terms of use",
+        "cookie", "subscribe", "newsletter", "all rights reserved", "advertisement",
+        "sign up", "privacy policy", "terms of use", "enable javascript",
     ]
     lowered = text.lower()
     return any(fragment in lowered for fragment in junk_fragments)
@@ -412,20 +481,15 @@ def parse_published(entry) -> Optional[datetime]:
 
 
 def extract_image(entry) -> Optional[str]:
-    media_content = entry.get("media_content") or []
-    for media in media_content:
-        url = media.get("url")
-        if url:
-            return url
+    for media in entry.get("media_content") or []:
+        if media.get("url"):
+            return media["url"]
 
-    media_thumbnail = entry.get("media_thumbnail") or []
-    for media in media_thumbnail:
-        url = media.get("url")
-        if url:
-            return url
+    for media in entry.get("media_thumbnail") or []:
+        if media.get("url"):
+            return media["url"]
 
-    enclosures = entry.get("enclosures") or []
-    for enclosure in enclosures:
+    for enclosure in entry.get("enclosures") or []:
         href = enclosure.get("href") or enclosure.get("url")
         media_type = (enclosure.get("type") or "").lower()
         if href and media_type.startswith("image"):
@@ -447,34 +511,22 @@ def extract_image(entry) -> Optional[str]:
     return None
 
 
-def shorten(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    trimmed = text[:limit].rsplit(" ", 1)[0].strip()
-    return f"{trimmed}…"
-
-
 def filter_by_day(items: List[dict], mode: str) -> List[dict]:
     today = datetime.now(LOCAL_TZ).date()
     yesterday = today - timedelta(days=1)
-    filtered: List[dict] = []
 
+    if mode == "All recent":
+        return items
+
+    filtered = []
     for item in items:
         published = item.get("published")
-        if mode == "All recent":
+        if mode == "Today" and published and published.date() == today:
             filtered.append(item)
-        elif mode == "Today":
-            if published and published.date() == today:
-                filtered.append(item)
-        elif mode == "Yesterday":
-            if published and published.date() == yesterday:
-                filtered.append(item)
+        elif mode == "Yesterday" and published and published.date() == yesterday:
+            filtered.append(item)
 
-    if filtered:
-        return filtered
-
-    # Fallback so the app never feels broken when feeds have older or missing timestamps.
-    return items
+    return filtered if filtered else items
 
 
 def filter_by_query(items: List[dict], query: str) -> List[dict]:
@@ -482,13 +534,65 @@ def filter_by_query(items: List[dict], query: str) -> List[dict]:
         return items
 
     query_lower = query.lower().strip()
-    results = []
-    for item in items:
-        haystack = " ".join([item["title"], item["summary"], item["source"], item["section"]]).lower()
-        if query_lower in haystack:
-            results.append(item)
-    return results
+    return [
+        item for item in items
+        if query_lower in " ".join([item["title"], item["summary"], item["source"], item["section"]]).lower()
+    ]
 
+
+def get_all_items(all_news: Dict[str, List[dict]]) -> List[dict]:
+    items = []
+    for section_items in all_news.values():
+        items.extend(section_items)
+    return sorted(
+        items,
+        key=lambda x: x["published"] or datetime(1970, 1, 1, tzinfo=LOCAL_TZ),
+        reverse=True,
+    )
+
+
+def build_top_briefing(all_news: Dict[str, List[dict]], day_mode: str, query: str) -> List[dict]:
+    all_items = get_all_items(all_news)
+    all_items = filter_by_day(all_items, day_mode)
+    all_items = filter_by_query(all_items, query)
+
+    # Balance the briefing so one category does not dominate everything.
+    section_counter = Counter()
+    picked = []
+    seen_titles: List[set] = []
+
+    for item in all_items:
+        sig = title_tokens(item["title"])
+        if is_similar_to_existing(sig, seen_titles, threshold=0.55):
+            continue
+        if section_counter[item["section"]] >= 2:
+            continue
+        section_counter[item["section"]] += 1
+        seen_titles.append(sig)
+        picked.append(item)
+        if len(picked) >= TOP_BRIEFING_ITEMS:
+            break
+
+    return picked
+
+
+def get_display_summary(item: dict, compact: bool = False) -> str:
+    summary = item.get("summary") or "No short summary provided."
+
+    if len(summary) < 180 and item.get("section") not in ["Health & Fitness", "Anime & Manga"]:
+        preview = fetch_article_preview(item["link"])
+        if preview:
+            summary = preview
+
+    if item.get("section") == "Health & Fitness":
+        return shorten(summary, FITNESS_SUMMARY_LIMIT)
+
+    return shorten(summary, COMPACT_SUMMARY_LIMIT if compact else DEFAULT_SUMMARY_LIMIT)
+
+
+# =========================================================
+# UI HELPERS
+# =========================================================
 
 def relative_time(dt: Optional[datetime]) -> str:
     if not dt:
@@ -507,25 +611,10 @@ def relative_time(dt: Optional[datetime]) -> str:
 
 def weather_label(code: Optional[int]) -> str:
     mapping = {
-        0: "Clear",
-        1: "Mostly clear",
-        2: "Partly cloudy",
-        3: "Overcast",
-        45: "Fog",
-        48: "Rime fog",
-        51: "Light drizzle",
-        53: "Drizzle",
-        55: "Heavy drizzle",
-        61: "Light rain",
-        63: "Rain",
-        65: "Heavy rain",
-        71: "Light snow",
-        73: "Snow",
-        75: "Heavy snow",
-        80: "Rain showers",
-        81: "Heavy showers",
-        82: "Violent showers",
-        95: "Thunderstorm",
+        0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast",
+        45: "Fog", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
+        61: "Light rain", 63: "Rain", 65: "Heavy rain", 71: "Light snow", 73: "Snow",
+        75: "Heavy snow", 80: "Rain showers", 81: "Heavy showers", 82: "Violent showers", 95: "Thunderstorm",
     }
     return mapping.get(code, "Weather update")
 
@@ -535,101 +624,135 @@ def today_fact() -> str:
     return DAILY_FACTS[index]
 
 
+def safe_round(value, fallback: int = 0) -> int:
+    try:
+        return round(float(value))
+    except Exception:
+        return fallback
+
+
 def render_top_bar() -> None:
-    logo_col, text_col = st.columns([1, 4])
     logo_path = Path("assets/logo.png")
+
+    st.markdown("<div class='hero-card'>", unsafe_allow_html=True)
+    logo_col, text_col = st.columns([1, 5], vertical_alignment="center")
 
     with logo_col:
         if logo_path.exists():
-            st.image(str(logo_path), width=140)
+            st.image(str(logo_path), width=120)
         else:
-            st.markdown(
-                """
-                <div style="height:96px;border:1px dashed var(--outline);border-radius:18px;display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--muted);background:var(--surface);">
-                    LOGO
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            st.markdown("<div class='logo-placeholder'>BZ</div>", unsafe_allow_html=True)
 
     with text_col:
-        st.markdown("<div class='brand-kicker'>Your daily scroll</div>", unsafe_allow_html=True)
-        st.title("Daily News Brief")
-        st.caption("Fast, simple headlines with enough detail to understand the story before work, on the train, or during a quick scroll.")
+        st.markdown("<div class='brand-kicker'>Your cleaner daily briefing</div>", unsafe_allow_html=True)
+        st.markdown("<h1 class='app-title'>Bipzilla News</h1>", unsafe_allow_html=True)
+        st.markdown(
+            "<p class='hero-copy'>A faster, cleaner news dashboard with fewer repeated stories, short explanations, weather, anime releases and quick filters.</p>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_summary_cards(weather: Optional[dict], total_articles: int) -> None:
+def render_dashboard_cards(weather: Optional[dict], total_articles: int, unique_today: int) -> None:
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.markdown("### 🌤️ Local weather")
+        st.markdown("<div class='mini-card'>", unsafe_allow_html=True)
+        st.markdown("<div class='mini-label'>London weather</div>", unsafe_allow_html=True)
         if weather:
             current = weather.get("current", {})
             daily = weather.get("daily", {})
+            high = (daily.get("temperature_2m_max") or [0])[0]
+            low = (daily.get("temperature_2m_min") or [0])[0]
             st.markdown(
-                f"**{weather['name']}**  \n"
-                f"{weather_label(current.get('weather_code'))} · {round(current.get('temperature_2m', 0))}°C  \n"
-                f"Feels like {round(current.get('apparent_temperature', 0))}°C · Wind {round(current.get('wind_speed_10m', 0))} km/h  \n"
-                f"High {round((daily.get('temperature_2m_max') or [0])[0])}°C · Low {round((daily.get('temperature_2m_min') or [0])[0])}°C"
+                f"<div class='mini-number'>{safe_round(current.get('temperature_2m'))}°C</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='mini-copy'>{weather_label(current.get('weather_code'))} · feels {safe_round(current.get('apparent_temperature'))}°C<br>High {safe_round(high)}°C · Low {safe_round(low)}°C</div>",
+                unsafe_allow_html=True,
             )
         else:
-            st.info("Weather could not be loaded right now.")
+            st.markdown("<div class='mini-copy'>Weather could not be loaded.</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with col2:
-        st.markdown("### 🧠 Daily fact")
-        st.write(today_fact())
+        st.markdown("<div class='mini-card'>", unsafe_allow_html=True)
+        st.markdown("<div class='mini-label'>Stories after clean-up</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='mini-number'>{total_articles}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='mini-copy'>{unique_today} available today. Repeated headlines are removed automatically.</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with col3:
-        st.markdown("### ⚡ Snapshot")
-        st.write(f"Articles found today: **{total_articles}**")
-        st.write(f"Updated: **{datetime.now(LOCAL_TZ).strftime('%d %b %Y, %H:%M')}**")
-        st.write("Aim: **10 to 15 minutes** for a full scroll.")
+        st.markdown("<div class='mini-card'>", unsafe_allow_html=True)
+        st.markdown("<div class='mini-label'>Daily fact</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='mini-copy'>{today_fact()}</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
-def get_display_summary(item: dict) -> str:
-    summary = item.get("summary") or "No short summary provided."
-    preview = None
+def render_article_card(item: dict, show_images: bool, compact: bool = False) -> None:
+    summary_text = get_display_summary(item, compact=compact)
+    image_url = item.get("image") if show_images else None
 
-    if len(summary) < 420 and item.get("section") != "Health & Fitness":
-        preview = fetch_article_preview(item["link"])
+    st.markdown("<div class='article-card'>", unsafe_allow_html=True)
 
-    final_text = preview or summary
+    if image_url:
+        image_col, content_col = st.columns([1, 4], gap="medium", vertical_alignment="top")
+        with image_col:
+            try:
+                st.image(image_url, use_container_width=True)
+            except Exception:
+                st.markdown("<div class='image-fallback'>🗞️</div>", unsafe_allow_html=True)
+        with content_col:
+            render_article_content(item, summary_text)
+    else:
+        render_article_content(item, summary_text)
 
-    if item.get("section") == "Health & Fitness":
-        return shorten(final_text, FITNESS_SUMMARY_LIMIT)
-
-    return shorten(final_text, DEFAULT_SUMMARY_LIMIT)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_article_card(item: dict, show_images: bool) -> None:
-    summary_text = get_display_summary(item)
-    domain = urlparse(item["link"]).netloc.replace("www.", "")
+def render_article_content(item: dict, summary_text: str) -> None:
+    st.markdown(
+        f"<div class='story-meta'><span>{item['section']}</span> · {item['source']} · {relative_time(item['published'])} · {item.get('domain', '')}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"<div class='story-title'>{item['title']}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='summary-copy'>{summary_text}</div>", unsafe_allow_html=True)
+    st.link_button("Read full story", item["link"], use_container_width=False)
 
-    with st.container(border=True):
-        has_image = show_images and bool(item.get("image"))
 
-        if has_image:
-            image_col, content_col = st.columns([1, 5], gap="medium")
-            with image_col:
-                try:
-                    st.image(item["image"], width=104)
-                except Exception:
-                    has_image = False
+def render_top_briefing(items: List[dict], show_images: bool) -> None:
+    st.markdown("## Today’s clean briefing")
+    st.caption("A short mixed feed from your sections, with repeated versions removed.")
 
-            with content_col:
-                st.markdown(f"<div class='story-title'>{item['title']}</div>", unsafe_allow_html=True)
-                st.caption(f"{item['source']} · {relative_time(item['published'])} · {domain}")
-                st.markdown(f"<div class='summary-copy'>{summary_text}</div>", unsafe_allow_html=True)
-                st.link_button("Read full story", item["link"], use_container_width=False)
-        else:
-            st.markdown(f"<div class='story-title'>{item['title']}</div>", unsafe_allow_html=True)
-            st.caption(f"{item['source']} · {relative_time(item['published'])} · {domain}")
-            st.markdown(f"<div class='summary-copy'>{summary_text}</div>", unsafe_allow_html=True)
-            st.link_button("Read full story", item["link"], use_container_width=False)
+    if not items:
+        st.info("No briefing items matched your filters right now.")
+        return
+
+    left, right = st.columns(2)
+    for index, item in enumerate(items):
+        with left if index % 2 == 0 else right:
+            render_article_card(item, show_images=show_images, compact=True)
+
+
+def render_section(section: str, items: List[dict], show_images: bool) -> None:
+    if not items:
+        st.info(f"No {section.lower()} items matched your filters right now.")
+        return
+
+    for item in items[:MAX_ITEMS_PER_SECTION]:
+        render_article_card(item, show_images=show_images, compact=False)
+
+    if section == "Anime & Manga":
+        render_anime_schedule()
 
 
 def render_anime_schedule() -> None:
-    st.markdown("## Anime calendar")
+    st.markdown("### Anime calendar")
     try:
         schedule = fetch_anime_schedule()
     except Exception:
@@ -639,12 +762,15 @@ def render_anime_schedule() -> None:
         st.info("Anime schedule could not be loaded right now.")
         return
 
-    for item in schedule[:6]:
-        line = f"**{item['title']}** · {item['day']} · {item['time']}"
-        if item.get("url"):
-            st.markdown(f"{line}  \n[Open details]({item['url']})")
-        else:
-            st.markdown(line)
+    cols = st.columns(2)
+    for index, item in enumerate(schedule[:6]):
+        with cols[index % 2]:
+            st.markdown("<div class='anime-card'>", unsafe_allow_html=True)
+            st.markdown(f"<strong>{item['title']}</strong>", unsafe_allow_html=True)
+            st.caption(f"{item['day']} · {item['time']}")
+            if item.get("url"):
+                st.link_button("Open details", item["url"], use_container_width=False)
+            st.markdown("</div>", unsafe_allow_html=True)
 
 
 def add_styles(theme_mode: str) -> None:
@@ -652,26 +778,30 @@ def add_styles(theme_mode: str) -> None:
 
     if is_dark:
         palette = {
-            "bg": "#0b1220",
+            "bg": "#07111f",
+            "bg2": "#0f172a",
             "surface": "#111827",
-            "surface_soft": "#0f172a",
+            "surface2": "#162033",
             "text": "#e5eefb",
             "muted": "#94a3b8",
             "outline": "rgba(148, 163, 184, 0.18)",
             "shadow": "rgba(2, 8, 23, 0.38)",
-            "accent": "#60a5fa",
+            "accent": "#38bdf8",
+            "accent2": "#a78bfa",
             "summary": "#d7e3f5",
         }
     else:
         palette = {
             "bg": "#f5f7fb",
+            "bg2": "#e9f0fb",
             "surface": "#ffffff",
-            "surface_soft": "#eef3fb",
+            "surface2": "#f8fafc",
             "text": "#0f172a",
             "muted": "#64748b",
-            "outline": "rgba(148, 163, 184, 0.18)",
+            "outline": "rgba(148, 163, 184, 0.24)",
             "shadow": "rgba(15, 23, 42, 0.08)",
             "accent": "#2563eb",
+            "accent2": "#7c3aed",
             "summary": "#334155",
         }
 
@@ -680,80 +810,201 @@ def add_styles(theme_mode: str) -> None:
         <style>
             :root {{
                 --bg: {palette['bg']};
+                --bg2: {palette['bg2']};
                 --surface: {palette['surface']};
-                --surface-soft: {palette['surface_soft']};
+                --surface2: {palette['surface2']};
                 --text: {palette['text']};
                 --muted: {palette['muted']};
                 --outline: {palette['outline']};
                 --shadow: {palette['shadow']};
                 --accent: {palette['accent']};
+                --accent2: {palette['accent2']};
                 --summary: {palette['summary']};
             }}
+
+            .stApp {{
+                background:
+                    radial-gradient(circle at top left, rgba(56, 189, 248, 0.18), transparent 32rem),
+                    linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
+            }}
+
             .block-container {{
-                max-width: 1120px;
-                padding-top: 1rem;
+                max-width: 1180px;
+                padding-top: 1.1rem;
                 padding-bottom: 3rem;
             }}
-            .stApp {{
-                background: linear-gradient(180deg, var(--bg) 0%, var(--surface-soft) 100%);
-            }}
-            .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {{
+
+            h1, h2, h3, p, div, span, label {{
                 color: var(--text);
             }}
-            div[data-testid="stVerticalBlockBorderWrapper"] {{
-                background: var(--surface);
-                border-radius: 20px;
-                box-shadow: 0 10px 30px var(--shadow);
+
+            .hero-card {{
+                background: linear-gradient(135deg, rgba(56,189,248,0.16), rgba(167,139,250,0.12)), var(--surface);
                 border: 1px solid var(--outline);
+                border-radius: 28px;
+                padding: 1.35rem;
+                box-shadow: 0 18px 45px var(--shadow);
+                margin-bottom: 1rem;
             }}
-            h1, h2, h3, h4, p, div, span, label {{
-                word-wrap: break-word;
-                color: var(--text);
+
+            .logo-placeholder {{
+                width: 92px;
+                height: 92px;
+                border-radius: 24px;
+                background: linear-gradient(135deg, var(--accent), var(--accent2));
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 2rem;
+                font-weight: 900;
+                color: white;
+                box-shadow: 0 12px 30px var(--shadow);
             }}
+
             .brand-kicker {{
                 color: var(--accent);
-                font-size: 0.86rem;
-                font-weight: 700;
+                font-size: 0.78rem;
+                font-weight: 800;
+                text-transform: uppercase;
+                letter-spacing: 0.12em;
+                margin-bottom: 0.2rem;
+            }}
+
+            .app-title {{
+                font-size: clamp(2.2rem, 6vw, 4.2rem);
+                line-height: 0.98;
+                margin: 0;
+                letter-spacing: -0.06em;
+            }}
+
+            .hero-copy {{
+                max-width: 780px;
+                color: var(--summary);
+                font-size: 1.05rem;
+                line-height: 1.7;
+                margin-top: 0.7rem;
+            }}
+
+            .mini-card, .article-card, .anime-card {{
+                background: rgba(255,255,255,0.02);
+                background-color: var(--surface);
+                border: 1px solid var(--outline);
+                border-radius: 22px;
+                padding: 1rem;
+                box-shadow: 0 12px 32px var(--shadow);
+                margin-bottom: 1rem;
+            }}
+
+            .mini-label {{
+                color: var(--muted);
+                font-size: 0.78rem;
+                font-weight: 800;
                 text-transform: uppercase;
                 letter-spacing: 0.08em;
-                margin-bottom: 0.25rem;
+                margin-bottom: 0.5rem;
             }}
-            .story-title {{
-                font-size: 1.22rem;
+
+            .mini-number {{
+                font-size: 2rem;
+                font-weight: 900;
+                letter-spacing: -0.04em;
+                color: var(--text);
+                margin-bottom: 0.35rem;
+            }}
+
+            .mini-copy {{
+                color: var(--summary);
+                line-height: 1.65;
+                font-size: 0.98rem;
+            }}
+
+            .story-meta {{
+                color: var(--muted);
+                font-size: 0.78rem;
                 font-weight: 700;
+                margin-bottom: 0.4rem;
+            }}
+
+            .story-meta span {{
+                background: linear-gradient(135deg, var(--accent), var(--accent2));
+                color: white;
+                padding: 0.2rem 0.55rem;
+                border-radius: 999px;
+                margin-right: 0.25rem;
+            }}
+
+            .story-title {{
+                font-size: 1.18rem;
+                font-weight: 850;
                 line-height: 1.35;
-                margin-bottom: 0.3rem;
+                letter-spacing: -0.02em;
+                margin-bottom: 0.45rem;
                 color: var(--text);
             }}
+
             .summary-copy {{
-                font-size: 1.04rem;
-                line-height: 1.78;
+                font-size: 0.98rem;
+                line-height: 1.72;
                 color: var(--summary);
-                margin-bottom: 0.9rem;
+                margin-bottom: 0.75rem;
             }}
-            .stCaptionContainer, [data-testid="stCaptionContainer"] {{
-                color: var(--muted);
+
+            .image-fallback {{
+                height: 94px;
+                border-radius: 18px;
+                border: 1px dashed var(--outline);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 2rem;
+                background: var(--surface2);
             }}
-            .stTextInput input, .stSelectbox div[data-baseweb="select"] > div, .stMultiSelect div[data-baseweb="select"] > div {{
+
+            div[data-testid="stImage"] img {{
+                border-radius: 18px;
+                border: 1px solid var(--outline);
+            }}
+
+            .stTextInput input,
+            .stSelectbox div[data-baseweb="select"] > div,
+            .stMultiSelect div[data-baseweb="select"] > div {{
                 background: var(--surface) !important;
                 color: var(--text) !important;
                 border: 1px solid var(--outline) !important;
-                border-radius: 14px !important;
+                border-radius: 16px !important;
             }}
-            .stButton button, .stLinkButton a {{
+
+            .stButton button,
+            .stLinkButton a {{
                 border-radius: 999px !important;
+                font-weight: 700 !important;
             }}
+
+            button[data-baseweb="tab"] {{
+                border-radius: 999px !important;
+                padding-left: 1rem !important;
+                padding-right: 1rem !important;
+            }}
+
+            .stCaptionContainer,
+            [data-testid="stCaptionContainer"] {{
+                color: var(--muted);
+            }}
+
             @media (max-width: 768px) {{
                 .block-container {{
-                    padding-left: 0.9rem;
-                    padding-right: 0.9rem;
+                    padding-left: 0.85rem;
+                    padding-right: 0.85rem;
+                }}
+                .hero-card {{
+                    padding: 1rem;
+                    border-radius: 22px;
                 }}
                 .story-title {{
-                    font-size: 1.08rem;
+                    font-size: 1.05rem;
                 }}
                 .summary-copy {{
-                    font-size: 1rem;
-                    line-height: 1.7;
+                    font-size: 0.95rem;
                 }}
             }}
         </style>
@@ -762,77 +1013,81 @@ def add_styles(theme_mode: str) -> None:
     )
 
 
+# =========================================================
+# MAIN APP
+# =========================================================
+
 def main() -> None:
     default_theme = st.session_state.get("theme_mode", "Dark")
     add_styles(default_theme)
     render_top_bar()
 
-    st.markdown("---")
+    with st.container():
+        controls_col1, controls_col2, controls_col3, controls_col4 = st.columns([2.5, 1.1, 1.1, 1])
 
-    controls_col1, controls_col2, controls_col3, controls_col4 = st.columns([2.2, 1.2, 1, 1])
-    with controls_col1:
-        search_query = st.text_input("Search headlines", placeholder="Try: Microsoft, data breach, Trump, AI, markets...")
-    with controls_col2:
-        day_mode = st.selectbox("Show", ["Today", "Yesterday", "All recent"], index=2)
-    with controls_col3:
-        show_images = st.toggle("Show images", value=True)
-    with controls_col4:
-        theme_mode = st.selectbox("Theme", ["Dark", "Light"], index=0 if default_theme == "Dark" else 1)
-        st.session_state["theme_mode"] = theme_mode
+        with controls_col1:
+            search_query = st.text_input(
+                "Search headlines",
+                placeholder="Try: Microsoft, data breach, AI, markets, anime...",
+            )
 
-    add_styles(theme_mode)
+        with controls_col2:
+            day_mode = st.selectbox("Show", ["Today", "Yesterday", "All recent"], index=2)
 
-    sections_to_show = st.multiselect(
+        with controls_col3:
+            show_images = st.toggle("Images", value=True)
+
+        with controls_col4:
+            theme_mode = st.selectbox("Theme", ["Dark", "Light"], index=0 if default_theme == "Dark" else 1)
+            st.session_state["theme_mode"] = theme_mode
+            add_styles(theme_mode)
+
+    selected_sections = st.multiselect(
         "Sections",
         options=list(FEEDS.keys()),
         default=list(FEEDS.keys()),
+        help="Untick sections you do not want to read today.",
     )
 
-    weather = None
-    try:
-        weather = fetch_weather("London")
-    except Exception:
-        weather = None
+    with st.spinner("Loading your clean briefing..."):
+        try:
+            all_news = load_all_news()
+        except Exception:
+            all_news = {section: [] for section in FEEDS}
 
-    try:
-        all_news = load_all_news()
-    except Exception:
-        all_news = {section: [] for section in FEEDS}
+        try:
+            weather = fetch_weather("London")
+        except Exception:
+            weather = None
 
-    today_count = 0
-    for section_items in all_news.values():
-        today_count += len(filter_by_day(section_items, "Today"))
+    total_articles = sum(len(items) for items in all_news.values())
+    unique_today = sum(len(filter_by_day(items, "Today")) for items in all_news.values())
 
-    render_summary_cards(weather, today_count)
+    render_dashboard_cards(weather, total_articles, unique_today)
+
+    top_items = build_top_briefing(
+        {section: all_news.get(section, []) for section in selected_sections},
+        day_mode=day_mode,
+        query=search_query,
+    )
+    render_top_briefing(top_items, show_images=show_images)
+
     st.markdown("---")
+    st.markdown("## Browse by section")
 
-    for section in sections_to_show:
-        st.markdown(f"## {section}")
-        original_items = all_news.get(section, [])
-        day_filtered_items = filter_by_day(original_items, day_mode)
-        items = filter_by_query(day_filtered_items, search_query)
-        fallback_used = False
+    if not selected_sections:
+        st.info("Choose at least one section to show news.")
+        return
 
-        if not items and day_mode != "All recent":
-            items = filter_by_query(original_items, search_query)
-            fallback_used = bool(items)
+    tabs = st.tabs(selected_sections)
+    for tab, section in zip(tabs, selected_sections):
+        with tab:
+            section_items = all_news.get(section, [])
+            section_items = filter_by_day(section_items, day_mode)
+            section_items = filter_by_query(section_items, search_query)
+            render_section(section, section_items, show_images=show_images)
 
-        items = items[:MAX_ITEMS_PER_SECTION]
-
-        if not items:
-            st.info(f"No {section.lower()} items matched your search right now.")
-            continue
-
-        if fallback_used:
-            st.caption(f"Showing latest available {section.lower()} stories because no items were found for {day_mode.lower()}.")
-
-        for item in items:
-            render_article_card(item, show_images=show_images)
-
-        if section == "Anime & Manga":
-            render_anime_schedule()
-
-        st.markdown("")
+    st.caption(f"Last refreshed: {datetime.now(LOCAL_TZ).strftime('%d %b %Y, %H:%M')} · RSS feeds cached for 15 minutes.")
 
 
 if __name__ == "__main__":
