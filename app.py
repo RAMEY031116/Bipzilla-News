@@ -527,17 +527,6 @@ def filter_by_day(items: List[dict], mode: str) -> List[dict]:
     return filtered if filtered else items
 
 
-def filter_by_query(items: List[dict], query: str) -> List[dict]:
-    if not query.strip():
-        return items
-
-    query_lower = query.lower().strip()
-    return [
-        item for item in items
-        if query_lower in " ".join([item["title"], item["summary"], item["source"], item["section"]]).lower()
-    ]
-
-
 def get_all_items(all_news: Dict[str, List[dict]]) -> List[dict]:
     items = []
     for section_items in all_news.values():
@@ -982,21 +971,15 @@ def main() -> None:
     render_top_bar()
 
     with st.container():
-        controls_col1, controls_col2, controls_col3, controls_col4 = st.columns([2.5, 1.1, 1.1, 1])
+        controls_col1, controls_col2, controls_col3 = st.columns([1.2, 1.1, 1])
 
         with controls_col1:
-            search_query = st.text_input(
-                "Search headlines",
-                placeholder="Try: Microsoft, data breach, AI, markets, anime...",
-            )
-
-        with controls_col2:
             day_mode = st.selectbox("Show", ["Today", "Yesterday", "All recent"], index=2)
 
-        with controls_col3:
+        with controls_col2:
             show_images = st.toggle("Images", value=True)
 
-        with controls_col4:
+        with controls_col3:
             theme_mode = st.selectbox("Theme", ["Dark", "Light"], index=0 if default_theme == "Dark" else 1)
             st.session_state["theme_mode"] = theme_mode
             add_styles(theme_mode)
@@ -1037,7 +1020,6 @@ def main() -> None:
         with tab:
             section_items = all_news.get(section, [])
             section_items = filter_by_day(section_items, day_mode)
-            section_items = filter_by_query(section_items, search_query)
             render_section(section, section_items, show_images=show_images)
 
     st.caption(f"Last refreshed: {datetime.now(LOCAL_TZ).strftime('%d %b %Y, %H:%M')} · RSS feeds cached for 15 minutes.")
