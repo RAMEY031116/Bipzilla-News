@@ -54,11 +54,24 @@ FEEDS: Dict[str, List[Dict[str, str]]] = {
     "Top Stories": [
         {"label": "BBC News", "url": "https://feeds.bbci.co.uk/news/rss.xml"},
     ],
+    "UK News": [
+        {"label": "BBC UK", "url": "https://feeds.bbci.co.uk/news/uk/rss.xml"},
+        {"label": "The Guardian UK", "url": "https://www.theguardian.com/uk-news/rss"},
+        {"label": "Sky News UK", "url": "https://feeds.skynews.com/feeds/rss/uk.xml"},
+    ],
     "Politics": [
         {"label": "BBC Politics", "url": "https://feeds.bbci.co.uk/news/politics/rss.xml"},
     ],
+    "UK Business": [
+        {"label": "BBC Business", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"},
+        {"label": "The Guardian Business", "url": "https://www.theguardian.com/uk/business/rss"},
+    ],
     "Finance": [
         {"label": "BBC Business", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"},
+    ],
+    "London": [
+        {"label": "BBC London", "url": "https://feeds.bbci.co.uk/news/england/london/rss.xml"},
+        {"label": "The Guardian London", "url": "https://www.theguardian.com/uk/london/rss"},
     ],
     "Tech": [
         {"label": "BBC Technology", "url": "https://feeds.bbci.co.uk/news/technology/rss.xml"},
@@ -886,6 +899,12 @@ def add_styles(theme_mode: str) -> None:
                 margin-right: 0.25rem;
             }}
 
+            .article-card:hover {{
+                border-color: var(--accent);
+                box-shadow: 0 16px 40px var(--shadow);
+                transition: border-color .2s ease, box-shadow .2s ease;
+            }}
+
             .story-title {{
                 font-size: 1.18rem;
                 font-weight: 850;
@@ -945,6 +964,9 @@ def add_styles(theme_mode: str) -> None:
             }}
 
             @media (max-width: 768px) {{
+                .app-title {{ font-size: 2.35rem; line-height: 1.05; }}
+                .mini-card, .article-card, .anime-card {{ padding: .85rem; border-radius: 16px; }}
+                button[data-baseweb="tab"] {{ padding-left: .65rem !important; padding-right: .65rem !important; }}
                 .block-container {{
                     padding-left: 0.85rem;
                     padding-right: 0.85rem;
@@ -989,6 +1011,12 @@ def main() -> None:
             st.session_state["theme_mode"] = theme_mode
             add_styles(theme_mode)
 
+    if st.button("↻ Refresh headlines", help="Reload cached news and weather"):
+        fetch_feed.clear()
+        load_all_news.clear()
+        fetch_weather.clear()
+        st.rerun()
+
     selected_sections = st.multiselect(
         "Sections",
         options=list(FEEDS.keys()),
@@ -1013,8 +1041,8 @@ def main() -> None:
     render_dashboard_cards(weather, total_articles, unique_today)
 
     st.markdown("---")
-    st.markdown("## News sections")
-    st.caption("Start with Top Stories, or choose a section to browse by topic.")
+    st.markdown("## Your news briefing")
+    st.caption("UK headlines, London updates and the stories that matter — choose a topic below.")
 
     if not selected_sections:
         st.info("Choose at least one section to show news.")
