@@ -153,7 +153,9 @@ STOP_WORDS = {
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_feed(url: str, section: str, source_label: str) -> List[dict]:
-    parsed = feedparser.parse(url)
+    response = requests.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    parsed = feedparser.parse(response.content)
     items: List[dict] = []
 
     for entry in parsed.entries:
@@ -163,7 +165,7 @@ def fetch_feed(url: str, section: str, source_label: str) -> List[dict]:
         published = parse_published(entry)
         image = extract_image(entry)
 
-        if not title or not link:
+        if not title or not link or urlparse(link).scheme not in {"http", "https"}:
             continue
 
         items.append(
@@ -371,7 +373,8 @@ def shorten(text: Optional[str], limit: int) -> str:
 
 def normalise_url(link: str) -> str:
     parsed = urlparse(link)
-    return f"{parsed.netloc}{parsed.path}".lower().strip("/")
+    path = parsed.path.rstrip("/") or "/"
+    return f"{parsed.netloc.lower()}{path}"
 
 
 def title_tokens(title: str) -> set:
@@ -524,7 +527,7 @@ def filter_by_day(items: List[dict], mode: str) -> List[dict]:
         elif mode == "Yesterday" and published and published.date() == yesterday:
             filtered.append(item)
 
-    return filtered if filtered else items
+    return filtered
 
 
 def get_all_items(all_news: Dict[str, List[dict]]) -> List[dict]:
@@ -541,7 +544,7 @@ def get_all_items(all_news: Dict[str, List[dict]]) -> List[dict]:
 def get_display_summary(item: dict, compact: bool = False) -> str:
     summary = item.get("summary") or "No short summary provided."
 
-    if len(summary) < 180 and item.get("section") not in ["Health & Fitness", "Anime & Manga"]:
+    if summary == "No short summary provided." and item.get("section") not in ["Health & Fitness", "Anime & Manga"]:
         preview = fetch_article_preview(item["link"])
         if preview:
             summary = preview
@@ -562,6 +565,8 @@ def relative_time(dt: Optional[datetime]) -> str:
 
     delta = datetime.now(LOCAL_TZ) - dt
     minutes = int(delta.total_seconds() // 60)
+    if minutes < 0:
+        return dt.strftime("%d %b %Y")
     if minutes < 60:
         return f"{max(minutes, 1)}m ago"
     hours = minutes // 60
@@ -652,7 +657,7 @@ def render_dashboard_cards(weather: Optional[dict], total_articles: int, unique_
     with col3:
         st.markdown("<div class='mini-card'>", unsafe_allow_html=True)
         st.markdown("<div class='mini-label'>Daily fact</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='mini-copy'>{today_fact()}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='mini-copy'>{html.escape(today_fact())}</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -679,11 +684,11 @@ def render_article_card(item: dict, show_images: bool, compact: bool = False) ->
 
 def render_article_content(item: dict, summary_text: str) -> None:
     st.markdown(
-        f"<div class='story-meta'><span>{item['section']}</span> · {item['source']} · {relative_time(item['published'])} · {item.get('domain', '')}</div>",
+        f"<div class='story-meta'><span>{html.escape(item['section'])}</span> · {html.escape(item['source'])} · {relative_time(item['published'])} · {html.escape(item.get('domain', ''))}</div>",
         unsafe_allow_html=True,
     )
-    st.markdown(f"<div class='story-title'>{item['title']}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='summary-copy'>{summary_text}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='story-title'>{html.escape(item['title'])}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='summary-copy'>{html.escape(summary_text)}</div>", unsafe_allow_html=True)
     st.link_button("Read full story", item["link"], use_container_width=False)
 
 
@@ -714,7 +719,7 @@ def render_anime_schedule() -> None:
     for index, item in enumerate(schedule[:6]):
         with cols[index % 2]:
             st.markdown("<div class='anime-card'>", unsafe_allow_html=True)
-            st.markdown(f"<strong>{item['title']}</strong>", unsafe_allow_html=True)
+            st.markdown(f"<strong>{html.escape(item['title'])}</strong>", unsafe_allow_html=True)
             st.caption(f"{item['day']} · {item['time']}")
             if item.get("url"):
                 st.link_button("Open details", item["url"], use_container_width=False)
