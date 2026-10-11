@@ -54,11 +54,24 @@ FEEDS: Dict[str, List[Dict[str, str]]] = {
     "Top Stories": [
         {"label": "BBC News", "url": "https://feeds.bbci.co.uk/news/rss.xml"},
     ],
+    "UK News": [
+        {"label": "BBC UK", "url": "https://feeds.bbci.co.uk/news/uk/rss.xml"},
+        {"label": "The Guardian UK", "url": "https://www.theguardian.com/uk-news/rss"},
+        {"label": "Sky News UK", "url": "https://feeds.skynews.com/feeds/rss/uk.xml"},
+    ],
     "Politics": [
         {"label": "BBC Politics", "url": "https://feeds.bbci.co.uk/news/politics/rss.xml"},
     ],
+    "UK Business": [
+        {"label": "BBC Business", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"},
+        {"label": "The Guardian Business", "url": "https://www.theguardian.com/uk/business/rss"},
+    ],
     "Finance": [
         {"label": "BBC Business", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"},
+    ],
+    "London": [
+        {"label": "BBC London", "url": "https://feeds.bbci.co.uk/news/england/london/rss.xml"},
+        {"label": "The Guardian London", "url": "https://www.theguardian.com/uk/london/rss"},
     ],
     "Tech": [
         {"label": "BBC Technology", "url": "https://feeds.bbci.co.uk/news/technology/rss.xml"},
@@ -153,7 +166,9 @@ STOP_WORDS = {
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_feed(url: str, section: str, source_label: str) -> List[dict]:
-    parsed = feedparser.parse(url)
+    response = requests.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    parsed = feedparser.parse(response.content)
     items: List[dict] = []
 
     for entry in parsed.entries:
@@ -163,7 +178,7 @@ def fetch_feed(url: str, section: str, source_label: str) -> List[dict]:
         published = parse_published(entry)
         image = extract_image(entry)
 
-        if not title or not link:
+        if not title or not link or urlparse(link).scheme not in {"http", "https"}:
             continue
 
         items.append(
@@ -371,7 +386,8 @@ def shorten(text: Optional[str], limit: int) -> str:
 
 def normalise_url(link: str) -> str:
     parsed = urlparse(link)
-    return f"{parsed.netloc}{parsed.path}".lower().strip("/")
+    path = parsed.path.rstrip("/") or "/"
+    return f"{parsed.netloc.lower()}{path}"
 
 
 def title_tokens(title: str) -> set:
@@ -524,7 +540,7 @@ def filter_by_day(items: List[dict], mode: str) -> List[dict]:
         elif mode == "Yesterday" and published and published.date() == yesterday:
             filtered.append(item)
 
-    return filtered if filtered else items
+    return filtered
 
 
 def get_all_items(all_news: Dict[str, List[dict]]) -> List[dict]:
@@ -541,7 +557,7 @@ def get_all_items(all_news: Dict[str, List[dict]]) -> List[dict]:
 def get_display_summary(item: dict, compact: bool = False) -> str:
     summary = item.get("summary") or "No short summary provided."
 
-    if len(summary) < 180 and item.get("section") not in ["Health & Fitness", "Anime & Manga"]:
+    if summary == "No short summary provided." and item.get("section") not in ["Health & Fitness", "Anime & Manga"]:
         preview = fetch_article_preview(item["link"])
         if preview:
             summary = preview
@@ -562,6 +578,8 @@ def relative_time(dt: Optional[datetime]) -> str:
 
     delta = datetime.now(LOCAL_TZ) - dt
     minutes = int(delta.total_seconds() // 60)
+    if minutes < 0:
+        return dt.strftime("%d %b %Y")
     if minutes < 60:
         return f"{max(minutes, 1)}m ago"
     hours = minutes // 60
@@ -652,7 +670,7 @@ def render_dashboard_cards(weather: Optional[dict], total_articles: int, unique_
     with col3:
         st.markdown("<div class='mini-card'>", unsafe_allow_html=True)
         st.markdown("<div class='mini-label'>Daily fact</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='mini-copy'>{today_fact()}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='mini-copy'>{html.escape(today_fact())}</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -679,12 +697,31 @@ def render_article_card(item: dict, show_images: bool, compact: bool = False) ->
 
 def render_article_content(item: dict, summary_text: str) -> None:
     st.markdown(
-        f"<div class='story-meta'><span>{item['section']}</span> · {item['source']} · {relative_time(item['published'])} · {item.get('domain', '')}</div>",
+        f"<div class='story-meta'><span>{html.escape(item['section'])}</span> · {html.escape(item['source'])} · {relative_time(item['published'])} · {html.escape(item.get('domain', ''))}</div>",
         unsafe_allow_html=True,
     )
-    st.markdown(f"<div class='story-title'>{item['title']}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='summary-copy'>{summary_text}</div>", unsafe_allow_html=True)
-    st.link_button("Read full story", item["link"], use_container_width=False)
+    st.markdown(f"<div class='story-title'>{html.escape(item['title'])}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='summary-copy'>{html.escape(summary_text)}</div>", unsafe_allow_html=True)
+    with st.expander("📖 More about this story"):
+        preview = item.get("summary") or ""
+        if len(preview) < 100:
+            preview = fetch_article_preview(item["link"]) or preview
+        if preview and preview != "No short summary provided.":
+            st.write(preview)
+        else:
+            st.caption("This publisher has not provided a detailed preview.")
+        if item.get("published"):
+            st.caption("Published: " + item["published"].strftime("%d %b %Y, %H:%M"))
+        st.link_button("Read full story at source ↗", item["link"])
+    import hashlib
+    saved = st.session_state.setdefault("saved_links", set())
+    key = "save_" + hashlib.sha256(item["link"].encode()).hexdigest()[:16]
+    if st.button("✓ Saved" if item["link"] in saved else "🔖 Save for later", key=key):
+        if item["link"] in saved:
+            saved.remove(item["link"])
+        else:
+            saved.add(item["link"])
+        st.rerun()
 
 
 def render_section(section: str, items: List[dict], show_images: bool) -> None:
@@ -714,7 +751,7 @@ def render_anime_schedule() -> None:
     for index, item in enumerate(schedule[:6]):
         with cols[index % 2]:
             st.markdown("<div class='anime-card'>", unsafe_allow_html=True)
-            st.markdown(f"<strong>{item['title']}</strong>", unsafe_allow_html=True)
+            st.markdown(f"<strong>{html.escape(item['title'])}</strong>", unsafe_allow_html=True)
             st.caption(f"{item['day']} · {item['time']}")
             if item.get("url"):
                 st.link_button("Open details", item["url"], use_container_width=False)
@@ -881,6 +918,13 @@ def add_styles(theme_mode: str) -> None:
                 margin-right: 0.25rem;
             }}
 
+            div[data-testid="stExpander"] {{ border: 1px solid var(--outline); border-radius: 14px; background: var(--surface2); margin: .5rem 0; }}
+            .article-card:hover {{
+                border-color: var(--accent);
+                box-shadow: 0 16px 40px var(--shadow);
+                transition: border-color .2s ease, box-shadow .2s ease;
+            }}
+
             .story-title {{
                 font-size: 1.18rem;
                 font-weight: 850;
@@ -940,6 +984,11 @@ def add_styles(theme_mode: str) -> None:
             }}
 
             @media (max-width: 768px) {{
+                .app-title {{ font-size: 2.35rem; line-height: 1.05; }}
+                .block-container {{ padding-bottom: 5rem; }}
+                .stButton button, .stLinkButton a {{ min-height: 44px; }}
+                .mini-card, .article-card, .anime-card {{ padding: .85rem; border-radius: 16px; }}
+                button[data-baseweb="tab"] {{ padding-left: .65rem !important; padding-right: .65rem !important; }}
                 .block-container {{
                     padding-left: 0.85rem;
                     padding-right: 0.85rem;
@@ -984,6 +1033,15 @@ def main() -> None:
             st.session_state["theme_mode"] = theme_mode
             add_styles(theme_mode)
 
+    if st.button("↻ Refresh headlines", help="Reload cached news and weather"):
+        fetch_feed.clear()
+        load_all_news.clear()
+        fetch_weather.clear()
+        st.rerun()
+
+    search_query = st.text_input("Search the news", placeholder="Search headlines and summaries…")
+    reader_mode = st.radio("View", ["All news", "Saved stories"], horizontal=True)
+
     selected_sections = st.multiselect(
         "Sections",
         options=list(FEEDS.keys()),
@@ -1008,8 +1066,8 @@ def main() -> None:
     render_dashboard_cards(weather, total_articles, unique_today)
 
     st.markdown("---")
-    st.markdown("## News sections")
-    st.caption("Start with Top Stories, or choose a section to browse by topic.")
+    st.markdown("## Your news briefing")
+    st.caption("UK headlines, London updates and the stories that matter — choose a topic below.")
 
     if not selected_sections:
         st.info("Choose at least one section to show news.")
@@ -1020,6 +1078,11 @@ def main() -> None:
         with tab:
             section_items = all_news.get(section, [])
             section_items = filter_by_day(section_items, day_mode)
+            if search_query.strip():
+                query = search_query.casefold().strip()
+                section_items = [item for item in section_items if query in (item.get("title", "") + " " + item.get("summary", "")).casefold()]
+            if reader_mode == "Saved stories":
+                section_items = [item for item in section_items if item["link"] in st.session_state.get("saved_links", set())]
             render_section(section, section_items, show_images=show_images)
 
     st.caption(f"Last refreshed: {datetime.now(LOCAL_TZ).strftime('%d %b %Y, %H:%M')} · RSS feeds cached for 15 minutes.")
