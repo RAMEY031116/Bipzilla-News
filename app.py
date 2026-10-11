@@ -702,7 +702,26 @@ def render_article_content(item: dict, summary_text: str) -> None:
     )
     st.markdown(f"<div class='story-title'>{html.escape(item['title'])}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='summary-copy'>{html.escape(summary_text)}</div>", unsafe_allow_html=True)
-    st.link_button("Read full story", item["link"], use_container_width=False)
+    with st.expander("📖 More about this story"):
+        preview = item.get("summary") or ""
+        if len(preview) < 100:
+            preview = fetch_article_preview(item["link"]) or preview
+        if preview and preview != "No short summary provided.":
+            st.write(preview)
+        else:
+            st.caption("This publisher has not provided a detailed preview.")
+        if item.get("published"):
+            st.caption("Published: " + item["published"].strftime("%d %b %Y, %H:%M"))
+        st.link_button("Read full story at source ↗", item["link"])
+    import hashlib
+    saved = st.session_state.setdefault("saved_links", set())
+    key = "save_" + hashlib.sha256(item["link"].encode()).hexdigest()[:16]
+    if st.button("✓ Saved" if item["link"] in saved else "🔖 Save for later", key=key):
+        if item["link"] in saved:
+            saved.remove(item["link"])
+        else:
+            saved.add(item["link"])
+        st.rerun()
 
 
 def render_section(section: str, items: List[dict], show_images: bool) -> None:
@@ -899,6 +918,7 @@ def add_styles(theme_mode: str) -> None:
                 margin-right: 0.25rem;
             }}
 
+            div[data-testid="stExpander"] {{ border: 1px solid var(--outline); border-radius: 14px; background: var(--surface2); margin: .5rem 0; }}
             .article-card:hover {{
                 border-color: var(--accent);
                 box-shadow: 0 16px 40px var(--shadow);
@@ -965,6 +985,8 @@ def add_styles(theme_mode: str) -> None:
 
             @media (max-width: 768px) {{
                 .app-title {{ font-size: 2.35rem; line-height: 1.05; }}
+                .block-container {{ padding-bottom: 5rem; }}
+                .stButton button, .stLinkButton a {{ min-height: 44px; }}
                 .mini-card, .article-card, .anime-card {{ padding: .85rem; border-radius: 16px; }}
                 button[data-baseweb="tab"] {{ padding-left: .65rem !important; padding-right: .65rem !important; }}
                 .block-container {{
@@ -1017,6 +1039,9 @@ def main() -> None:
         fetch_weather.clear()
         st.rerun()
 
+    search_query = st.text_input("Search the news", placeholder="Search headlines and summaries…")
+    reader_mode = st.radio("View", ["All news", "Saved stories"], horizontal=True)
+
     selected_sections = st.multiselect(
         "Sections",
         options=list(FEEDS.keys()),
@@ -1053,6 +1078,11 @@ def main() -> None:
         with tab:
             section_items = all_news.get(section, [])
             section_items = filter_by_day(section_items, day_mode)
+            if search_query.strip():
+                query = search_query.casefold().strip()
+                section_items = [item for item in section_items if query in (item.get("title", "") + " " + item.get("summary", "")).casefold()]
+            if reader_mode == "Saved stories":
+                section_items = [item for item in section_items if item["link"] in st.session_state.get("saved_links", set())]
             render_section(section, section_items, show_images=show_images)
 
     st.caption(f"Last refreshed: {datetime.now(LOCAL_TZ).strftime('%d %b %Y, %H:%M')} · RSS feeds cached for 15 minutes.")
