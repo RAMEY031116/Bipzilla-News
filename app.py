@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 # =========================================================
 
 LOCAL_TZ = ZoneInfo("Europe/London")
-MAX_ITEMS_PER_SECTION = 6
+MAX_ITEMS_PER_SECTION = 12
 DEFAULT_SUMMARY_LIMIT = 360
 COMPACT_SUMMARY_LIMIT = 220
 FITNESS_SUMMARY_LIMIT = 150
@@ -713,6 +713,9 @@ def render_article_content(item: dict, summary_text: str) -> None:
         if item.get("published"):
             st.caption("Published: " + item["published"].strftime("%d %b %Y, %H:%M"))
         st.link_button("Read full story at source ↗", item["link"])
+        if st.button("✓ Mark as read", key="read_" + __import__("hashlib").sha256(item["link"].encode()).hexdigest()[:16]):
+            st.session_state.setdefault("read_links", set()).add(item["link"])
+            st.rerun()
     import hashlib
     saved = st.session_state.setdefault("saved_links", set())
     key = "save_" + hashlib.sha256(item["link"].encode()).hexdigest()[:16]
@@ -919,7 +922,8 @@ def add_styles(theme_mode: str) -> None:
             }}
 
             div[data-testid="stExpander"] {{ border: 1px solid var(--outline); border-radius: 14px; background: var(--surface2); margin: .5rem 0; }}
-            .article-card:hover {{
+            .article-card {{ transition: transform .2s ease, border-color .2s ease; }}
+            .article-card:hover {{ transform: translateY(-2px);
                 border-color: var(--accent);
                 box-shadow: 0 16px 40px var(--shadow);
                 transition: border-color .2s ease, box-shadow .2s ease;
@@ -1040,7 +1044,7 @@ def main() -> None:
         st.rerun()
 
     search_query = st.text_input("Search the news", placeholder="Search headlines and summaries…")
-    reader_mode = st.radio("View", ["All news", "Saved stories"], horizontal=True)
+    reader_mode = st.radio("View", ["Daily scroll", "By topic", "Saved stories", "Unread"], horizontal=True)
 
     selected_sections = st.multiselect(
         "Sections",
@@ -1067,10 +1071,30 @@ def main() -> None:
 
     st.markdown("---")
     st.markdown("## Your news briefing")
+    st.caption(datetime.now(LOCAL_TZ).strftime("%A %d %B %Y") + " · Your personal daily edition")
+    read_count = len(st.session_state.get("read_links", set()))
+    st.progress(min(read_count / max(total_articles, 1), 1.0), text=f"{read_count} stories marked as read")
     st.caption("UK headlines, London updates and the stories that matter — choose a topic below.")
 
     if not selected_sections:
         st.info("Choose at least one section to show news.")
+        return
+
+    if reader_mode == "Daily scroll":
+        daily_items = get_all_items({section: all_news.get(section, []) for section in selected_sections})
+        daily_items = filter_by_day(daily_items, day_mode)
+        if search_query.strip():
+            query = search_query.casefold().strip()
+            daily_items = [item for item in daily_items if query in (item.get("title", "") + " " + item.get("summary", "")).casefold()]
+        st.subheader("📰 Your daily edition")
+        st.caption(f"{len(daily_items)} stories · Newest first · Tap to learn more")
+        if not daily_items:
+            st.info("No matching stories. Try All recent or a different search.")
+        page_size = st.select_slider("Stories to show", options=[10, 20, 40, 80], value=20)
+        for item in daily_items[:page_size]:
+            render_article_card(item, show_images=show_images, compact=True)
+        if len(daily_items) > page_size:
+            st.caption(f"Showing {page_size} of {len(daily_items)} stories. Increase Stories to show to continue.")
         return
 
     tabs = st.tabs(selected_sections)
@@ -1081,6 +1105,8 @@ def main() -> None:
             if search_query.strip():
                 query = search_query.casefold().strip()
                 section_items = [item for item in section_items if query in (item.get("title", "") + " " + item.get("summary", "")).casefold()]
+            if reader_mode == "Unread":
+                section_items = [item for item in section_items if item["link"] not in st.session_state.get("read_links", set())]
             if reader_mode == "Saved stories":
                 section_items = [item for item in section_items if item["link"] in st.session_state.get("saved_links", set())]
             render_section(section, section_items, show_images=show_images)
